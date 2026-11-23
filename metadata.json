@@ -1,0 +1,6 @@
+{
+  "name": "BeamTV",
+  "description": "High-speed offline video and file sharing suite with two dedicated Android apps: BeamTV (Mobile Sender with QR scanner) and BeamTV TV (Android TV Receiver with QR generator and built-in ExoPlayer).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

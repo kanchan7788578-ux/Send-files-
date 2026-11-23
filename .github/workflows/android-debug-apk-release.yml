@@ -1,0 +1,194 @@
+name: Build & Publish Debug APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-debug-apk:
+    name: Build Installable Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Detect Gradle configuration
+        id: gradle_env
+        shell: bash
+        run: |
+          if [ -f ./gradlew ]; then
+            echo "has_wrapper=true" >> "$GITHUB_OUTPUT"
+            echo "gradle_version=" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_wrapper=false" >> "$GITHUB_OUTPUT"
+            GRADLE_VER=""
+            if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+              GRADLE_VER=$(grep -E '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties \
+                | sed -E 's/.*gradle-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*/\1/' || true)
+            fi
+            echo "gradle_version=${GRADLE_VER:-9.3.1}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Gradle (with wrapper)
+        if: steps.gradle_env.outputs.has_wrapper == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Gradle (without wrapper)
+        if: steps.gradle_env.outputs.has_wrapper == 'false'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.gradle_env.outputs.gradle_version }}
+
+      - name: Ensure Android SDK licenses are accepted
+        shell: bash
+        run: |
+          SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ -n "$SDK_DIR" ] && [ -x "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          fi
+
+      - name: Prepare debug signing keystore
+        shell: bash
+        run: |
+          if [ ! -f debug.keystore ]; then
+            if [ -f debug.keystore.base64 ]; then
+              base64 -d debug.keystore.base64 > debug.keystore
+              echo "Restored debug.keystore from debug.keystore.base64"
+            else
+              keytool -genkeypair -v \
+                -keystore debug.keystore \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+              echo "Generated fallback debug.keystore"
+            fi
+          fi
+
+      - name: Build installable debug APK(s)
+        shell: bash
+        run: |
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            GRADLE_CMD="./gradlew"
+          else
+            GRADLE_CMD="gradle"
+          fi
+          "$GRADLE_CMD" assembleDebug --no-daemon --stacktrace
+
+      - name: Collect, verify, and stage debug APK(s)
+        shell: bash
+        run: |
+          rm -rf release-apks
+          mkdir -p release-apks
+
+          mapfile -t APKS < <(find . -path "*/build/outputs/apk/debug/*.apk" ! -name "*-unsigned.apk" -type f | sort)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "Error: No signed debug APK found under */build/outputs/apk/debug/"
+            exit 1
+          fi
+
+          SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          APKSIGNER_BIN=$(find "$SDK_DIR/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1 || true)
+
+          PRIMARY_COPIED=false
+          for apk in "${APKS[@]}"; do
+            fname=$(basename "$apk")
+            if [ -n "$APKSIGNER_BIN" ]; then
+              echo "Verifying APK signature: $apk"
+              "$APKSIGNER_BIN" verify --verbose "$apk"
+            fi
+            cp "$apk" "release-apks/$fname"
+            if [[ "$apk" == ./app/build/outputs/apk/debug/* ]] && [ "$PRIMARY_COPIED" = false ]; then
+              cp "$apk" "release-apks/app-debug.apk"
+              PRIMARY_COPIED=true
+            fi
+          done
+
+          if [ ! -f "release-apks/app-debug.apk" ]; then
+            cp "${APKS[0]}" "release-apks/app-debug.apk"
+          fi
+
+          (cd release-apks && sha256sum *.apk > SHA256SUMS.txt)
+          ls -lh release-apks/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk-artifacts
+          path: release-apks/*.apk
+          retention-days: 30
+
+      - name: Publish GitHub Release with permanent direct APK URL
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            RELEASE_TAG="${{ github.ref_name }}"
+            RELEASE_TITLE="Debug APK (${{ github.ref_name }})"
+          else
+            RELEASE_TAG="latest"
+            RELEASE_TITLE="Latest Debug APK"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -f "$RELEASE_TAG" "${{ github.sha }}"
+            git push -f origin "refs/tags/$RELEASE_TAG"
+          fi
+
+          REPO="${{ github.repository }}"
+          NOTES_FILE=$(mktemp)
+          {
+            echo "Automated installable debug APK build from commit \`${{ github.sha }}\`."
+            echo ""
+            echo "### Permanent Direct APK Download URL(s)"
+            for f in release-apks/*.apk; do
+              name=$(basename "$f")
+              echo "- **${name}**: https://github.com/${REPO}/releases/latest/download/${name}"
+            done
+            echo ""
+            echo "### SHA-256 Checksums"
+            echo '```'
+            cat release-apks/SHA256SUMS.txt
+            echo '```'
+          } > "$NOTES_FILE"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-apks/* --clobber
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes-file "$NOTES_FILE" \
+              --latest
+          else
+            gh release create "$RELEASE_TAG" release-apks/* \
+              --title "$RELEASE_TITLE" \
+              --notes-file "$NOTES_FILE" \
+              --latest
+          fi
+
+          {
+            echo "## Debug APK Published"
+            echo ""
+            for f in release-apks/*.apk; do
+              name=$(basename "$f")
+              echo "- **${name}**: \`https://github.com/${REPO}/releases/latest/download/${name}\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
